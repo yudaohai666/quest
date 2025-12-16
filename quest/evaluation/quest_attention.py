@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 
 import types
+import transformers
 
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
@@ -19,6 +20,10 @@ from transformers.models.llama.modeling_llama import (
 from transformers.cache_utils import DynamicCache
 
 from transformers.models.mistral.modeling_mistral import MistralAttention
+
+# 检测 transformers 版本
+TRANSFORMERS_VERSION = tuple(int(x) for x in transformers.__version__.split('.')[:2])
+IS_TRANSFORMERS_V4_53_PLUS = TRANSFORMERS_VERSION >= (4, 53)
 
 def local_heavy_hitter_mask(attn_weights, token_budget, chunk_size):
     # attn_weights (BS, head, query, keys)
@@ -82,7 +87,7 @@ def forward(
     bsz, q_len, _ = hidden_states.size()
 
     if q_len > 1 or self.layer_id < 2:
-        return self.flash_forward(
+        result = self.flash_forward(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -91,6 +96,10 @@ def forward(
             use_cache=use_cache,
             **kwargs,
         )
+        # 4.53+ 返回 2 个值，需要补充为 3 个值
+        if IS_TRANSFORMERS_V4_53_PLUS and len(result) == 2:
+            return result[0], result[1], past_key_value
+        return result
 
     # Get attributes from config for compatibility with transformers 4.53+
     num_heads = getattr(self, 'num_heads', self.config.num_attention_heads)
@@ -123,17 +132,16 @@ def forward(
             assert isinstance(past_key_value, tuple)
             kv_seq_len += past_key_value[0].shape[-2]
     
-    # Handle position embeddings - different for transformers 4.53+
-    if 'position_embeddings' in kwargs:
-        # New version: position_embeddings passed as parameter
+    # Handle position embeddings - 适配 4.45.0 和 4.53.2
+    if IS_TRANSFORMERS_V4_53_PLUS:
+        # 4.53+: position_embeddings 作为参数传入
         cos, sin = kwargs['position_embeddings']
-        # In new version, position_ids is deprecated in apply_rotary_pos_emb
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     else:
-        # Old version: use rotary_emb attribute
-        cos, sin = self.rotary_emb(value_states, position_ids.to(value_states.device))
+        # 4.45.0: rotary_emb 接收 (x, position_ids) 参数
+        cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, position_ids
+            query_states, key_states, cos, sin
         )
     # [bsz, nh, t, hd]
 
@@ -253,15 +261,8 @@ def forward(
     if not output_attentions:
         attn_weights = None
 
-    # Handle return values - different for transformers 4.53+
-    # New version expects 2 values (attn_output, attn_weights)
-    # Old version expects 3 values (attn_output, attn_weights, past_key_value)
-    if 'position_embeddings' in kwargs:
-        # New version: only return 2 values, cache is managed internally
-        return attn_output, attn_weights
-    else:
-        # Old version: return 3 values including past_key_value
-        return attn_output, attn_weights, past_key_value
+    # 始终返回 3 个值以保持兼容性
+    return attn_output, attn_weights, past_key_value
 
 
 global layer_id
